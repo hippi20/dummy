@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Dataset Editor</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f7f7f7; margin: 0; }
+        .container { max-width: 800px; margin: 40px auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px #0001; padding: 32px; }
+        .row { display: flex; align-items: center; margin-bottom: 18px; }
+        .label { width: 140px; font-weight: bold; }
+        .input, select, textarea { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+        .input[readonly] { background: #f0f0f0; }
+        .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        .btn-primary { background: #1976d2; color: #fff; }
+        .btn-adv { background: #eee; color: #1976d2; border: 1px solid #1976d2; margin-left: auto; }
+        .btn-adv.active { background: #1976d2; color: #fff; }
+        .btn-danger { background: #e53935; color: #fff; margin-left: 8px; }
+        .btn-add { background: #43a047; color: #fff; margin-left: 8px; }
+        .multi-select { min-height: 36px; background: #f9f9f9; border: 1px solid #bdbdbd; border-radius: 6px; font-size: 1em; transition: border 0.2s; }
+        .multi-select:focus { border: 1.5px solid #1976d2; background: #f0f7ff; }
+        .field-row { display: flex; align-items: center; margin-bottom: 8px; }
+        .field-row input { margin-right: 8px; }
+        .preview { background: #f4f4f4; border-radius: 4px; padding: 16px; font-family: monospace; margin-top: 24px; }
+        .right { float: right; }
+        .hidden { display: none; }
+        .adv-btns { margin-top: 10px; }
+        .datatype-dropdown { margin-left: 8px; }
+        .toggle-btn { background: none; border: none; font-size: 1.2em; cursor: pointer; margin-right: 4px; }
+        .subfields { margin-left: 32px; border-left: 2px solid #eee; padding-left: 12px; }
+        .teamnames-summary { color: #555; font-size: 0.95em; margin-left: 8px; }
+        .teamnames-list { margin-left: 32px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="row" style="justify-content: space-between;">
+        <div style="font-size: 1.5em; font-weight: bold;">DynamoDB Dataset Editor</div>
+        <button id="advModeBtn" class="btn btn-adv">Advanced Mode</button>
+    </div>
+
+    <form id="datasetForm" method="post" enctype="multipart/form-data">
+        {% csrf_token %}
+        <div class="row">
+            <div class="label">Dataset Name:</div>
+            <input class="input" type="text" id="datasetName" name="datasetName" required>
+        </div>
+
+        <div class="row">
+            <div class="label">Partition Keys:</div>
+            <select id="partitionKeys" class="input multi-select" multiple size="3" style="min-width:180px;">
+                <option value="kpigroup">kpigroup</option>
+                <option value="sessionid">sessionid</option>
+                <option value="dt">dt</option>
+            </select>
+            <span style="margin-left:8px; color:#888; font-size:0.95em;">(Hold Ctrl/Cmd or Shift to select multiple)</span>
+        </div>
+
+        <div class="row" id="teamNamesRow">
+            <div class="label">Team Names:</div>
+            <button type="button" id="toggleTeamNames" class="toggle-btn">▼</button>
+            <span id="teamNamesSummary" class="teamnames-summary"></span>
+        </div>
+        <div id="teamNamesList" class="teamnames-list"></div>
+
+        <div class="row adv-btns hidden" id="advBtns">
+            <button type="button" class="btn btn-add" id="addAttrBtn">Add Attribute</button>
+        </div>
+        <div id="addAttrForm" class="row hidden"></div>
+
+        <!-- CSV Upload UI -->
+        <div class="row" id="csvUploadRow">
+            <div class="label">Upload CSV:</div>
+            <input type="file" id="csvFileInput" accept=".csv" style="flex:2;">
+            <button type="button" class="btn btn-primary" id="uploadCsvBtn">Upload</button>
+        </div>
+
+        <div id="fieldsList"></div>
+        <div id="customAttrsList"></div>
+
+        <div class="preview">
+            <div style="font-weight: bold; margin-bottom: 8px;">JSON Preview</div>
+            <pre id="jsonPreview"></pre>
+        </div>
+
+        <div class="row" style="justify-content: flex-end; margin-top: 24px;">
+            <button type="submit" class="btn btn-primary">Submit to DDB</button>
+        </div>
+    </form>
+</div>
+
+<script>
+let advMode = false;
+let fields = {}; // { fieldName: { type: 'string', value: '', subfields: {} } }
+let customAttrs = {}; // { attrName: { type, value, subfields } }
+let partitionKeys = [];
+let teamNames = [];
+let teamNamesExpanded = true;
+let jsonData = {};
+let csvFieldsOnly = {}; // fields loaded from CSV, NOT merged into UI
+
+const advModeBtn = document.getElementById('advModeBtn');
+const advBtns = document.getElementById('advBtns');
+const addAttrBtn = document.getElementById('addAttrBtn');
+const addAttrForm = document.getElementById('addAttrForm');
+const fieldsList = document.getElementById('fieldsList');
+const customAttrsList = document.getElementById('customAttrsList');
+const partitionKeysSelect = document.getElementById('partitionKeys');
+const jsonPreview = document.getElementById('jsonPreview');
+const datasetNameInput = document.getElementById('datasetName');
+const teamNamesRow = document.getElementById('teamNamesRow');
+const teamNamesList = document.getElementById('teamNamesList');
+const teamNamesSummary = document.getElementById('teamNamesSummary');
+const toggleTeamNames = document.getElementById('toggleTeamNames');
+const datasetForm = document.getElementById('datasetForm');
+const csvFileInput = document.getElementById('csvFileInput');
+const uploadCsvBtn = document.getElementById('uploadCsvBtn');
+
+const DATATYPES = [
+    { value: 'string', label: 'String' },
+    { value: 'float', label: 'Float' },
+    { value: 'number', label: 'Number' },
+    { value: 'map', label: 'Map' }
+];
+
+function renderTeamNames() {
+    teamNamesList.innerHTML = '';
+    if (!teamNamesExpanded) {
+        teamNamesList.style.display = 'none';
+        teamNamesSummary.textContent = teamNames.length ? teamNames.join(', ') : '(none)';
+        toggleTeamNames.textContent = '▶';
+        return;
+    }
+    teamNamesList.style.display = '';
+    teamNamesSummary.textContent = '';
+    toggleTeamNames.textContent = '▼';
+    teamNames.forEach((name, idx) => {
+        const row = document.createElement('div');
+        row.className = 'field-row';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = name;
+        input.className = 'input';
+        input.onchange = e => {
+            teamNames[idx] = e.target.value;
+            updateJsonPreview();
+        };
+        row.appendChild(input);
+        const delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'btn btn-danger';
+        delBtn.textContent = '×';
+        delBtn.onclick = () => {
+            teamNames.splice(idx, 1);
+            renderTeamNames();
+            updateJsonPreview();
+        };
+        row.appendChild(delBtn);
+        teamNamesList.appendChild(row);
+    });
+    // Add new team name
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'btn btn-add';
+    addBtn.textContent = '+ Add Team';
+    addBtn.onclick = () => {
+        teamNames.push('');
+        renderTeamNames();
+        updateJsonPreview();
+    };
+    teamNamesList.appendChild(addBtn);
+}
+
+toggleTeamNames.onclick = () => {
+    teamNamesExpanded = !teamNamesExpanded;
+    renderTeamNames();
+};
+
+function renderFieldsList() {
+    fieldsList.innerHTML = '';
+    Object.entries(fields).forEach(([name, info]) => {
+        renderFieldRow(fieldsList, name, info, fields, 0, false);
+    });
+}
+
+function renderCustomAttrsList() {
+    customAttrsList.innerHTML = '';
+    Object.entries(customAttrs).forEach(([name, info]) => {
+        renderFieldRow(customAttrsList, name, info, customAttrs, 0, true);
+    });
+}
+
+function renderFieldRow(container, name, info, parentObj, depth, isCustom) {
+    const row = document.createElement('div');
+    row.className = 'field-row';
+    // Expand/collapse for map
+    let isMap = info.type === 'map';
+    let expanded = info._expanded !== false;
+    if (isMap) {
+        const toggleBtn = document.createElement('button');
+        toggleBtn.type = 'button';
+        toggleBtn.className = 'toggle-btn';
+        toggleBtn.textContent = expanded ? '▼' : '▶';
+        toggleBtn.onclick = () => {
+            info._expanded = !expanded;
+            if (isCustom) renderCustomAttrsList(); else renderFieldsList();
+        };
+        row.appendChild(toggleBtn);
+    }
+    // Field name
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = name;
+    nameInput.className = 'input';
+    nameInput.readOnly = !advMode;
+    nameInput.onchange = e => {
+        if (e.target.value && e.target.value !== name) {
+            parentObj[e.target.value] = { ...info };
+            delete parentObj[name];
+            if (isCustom) renderCustomAttrsList(); else renderFieldsList();
+            updateJsonPreview();
+        }
+    };
+    row.appendChild(nameInput);
+    // Type
+    const typeSelect = document.createElement('select');
+    DATATYPES.forEach(dt => {
+        const opt = document.createElement('option');
+        opt.value = dt.value;
+        opt.textContent = dt.label;
+        if (info.type === dt.value) opt.selected = true;
+        typeSelect.appendChild(opt);
+    });
+    typeSelect.disabled = !advMode;
+    typeSelect.className = 'input datatype-dropdown';
+    typeSelect.onchange = e => {
+        info.type = e.target.value;
+        if (info.type === 'map' && !info.subfields) info.subfields = {};
+        if (info.type !== 'map') delete info.subfields;
+        if (isCustom) renderCustomAttrsList(); else renderFieldsList();
+        updateJsonPreview();
+    };
+    row.appendChild(typeSelect);
+    // Value (optional, for advanced mode)
+    if (advMode && info.type !== 'map') {
+        const valInput = document.createElement('input');
+        valInput.type = 'text';
+        valInput.value = info.value || '';
+        valInput.placeholder = 'Value (optional)';
+        valInput.className = 'input';
+        valInput.onchange = e => {
+            info.value = e.target.value;
+            updateJsonPreview();
+        };
+        row.appendChild(valInput);
+    }
+    // Remove button
+    if (advMode) {
+        const delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'btn btn-danger';
+        delBtn.textContent = '×';
+        delBtn.onclick = () => {
+            delete parentObj[name];
+            if (isCustom) renderCustomAttrsList(); else renderFieldsList();
+            updateJsonPreview();
+        };
+        row.appendChild(delBtn);
+    }
+    container.appendChild(row);
+    // Subfields for map
+    if (isMap && expanded) {
+        const subDiv = document.createElement('div');
+        subDiv.className = 'subfields';
+        if (!info.subfields) info.subfields = {};
+        Object.entries(info.subfields).forEach(([subName, subInfo]) => {
+            renderFieldRow(subDiv, subName, subInfo, info.subfields, depth + 1, isCustom);
+        });
+        // Add subfield button (adv mode)
+        if (advMode) {
+            const addSubBtn = document.createElement('button');
+            addSubBtn.type = 'button';
+            addSubBtn.className = 'btn btn-add';
+            addSubBtn.textContent = '+ Add Subfield';
+            addSubBtn.onclick = () => showAddSubfieldForm(info.subfields, subDiv, isCustom);
+            subDiv.appendChild(addSubBtn);
+        }
+        container.appendChild(subDiv);
+    }
+}
+
+function showAddSubfieldForm(subfieldsObj, container, isCustom) {
+    // Only one form at a time
+    if (container.querySelector('.add-field-form')) return;
+    const formDiv = document.createElement('div');
+    formDiv.className = 'add-field-form field-row';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'Subfield name';
+    nameInput.className = 'input';
+    const typeSelect = document.createElement('select');
+    DATATYPES.forEach(dt => {
+        const opt = document.createElement('option');
+        opt.value = dt.value;
+        opt.textContent = dt.label;
+        typeSelect.appendChild(opt);
+    });
+    typeSelect.className = 'input datatype-dropdown';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'btn btn-add';
+    addBtn.textContent = 'Add';
+    addBtn.onclick = () => {
+        const name = nameInput.value.trim();
+        const type = typeSelect.value;
+        if (name && !(name in subfieldsObj)) {
+            subfieldsObj[name] = { type };
+            formDiv.remove();
+            renderTeamNames();
+            if (isCustom) renderCustomAttrsList(); else renderFieldsList();
+            updateJsonPreview();
+        }
+    };
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => formDiv.remove();
+    formDiv.appendChild(nameInput);
+    formDiv.appendChild(typeSelect);
+    formDiv.appendChild(addBtn);
+    formDiv.appendChild(cancelBtn);
+    container.appendChild(formDiv);
+}
+
+function updateJsonPreview() {
+    // Recursively build the JSON structure
+    function buildFieldsM(obj) {
+        const result = {};
+        Object.entries(obj).forEach(([name, info]) => {
+            if (info.type === 'map') {
+                result[name] = { map: buildFieldsM(info.subfields || {}) };
+            } else {
+                result[name] = { string: info.type };
+            }
+        });
+        return result;
+    }
+    function buildCustomAttrs(obj) {
+        const result = {};
+        Object.entries(obj).forEach(([name, info]) => {
+            if (info.type === 'map') {
+                result[name] = { map: buildFieldsM(info.subfields || {}) };
+            } else {
+                result[name] = info.value !== undefined && info.value !== '' ? info.value : info.type;
+            }
+        });
+        return result;
+    }
+    // Merge csvFieldsOnly and fields, with fields taking precedence
+    function mergeFields(csvObj, manualObj) {
+        return { ...csvObj, ...manualObj };
+    }
+    const fieldsM = mergeFields(
+        buildFieldsM(csvFieldsOnly),
+        buildFieldsM(fields)
+    );
+    const customAttrsObj = buildCustomAttrs(customAttrs);
+    jsonData = {
+        DatasetName: datasetNameInput.value,
+        Fields: { M: fieldsM },
+        PartitionKeys: Array.from(partitionKeysSelect.selectedOptions).map(o => o.value),
+        TeamNames: teamNames.filter(t => t.trim() !== ''),
+        ...customAttrsObj
+    };
+    jsonPreview.textContent = JSON.stringify(jsonData, null, 2);
+}
+
+advModeBtn.onclick = () => {
+    advMode = !advMode;
+    advModeBtn.classList.toggle('active', advMode);
+    advBtns.classList.toggle('hidden', !advMode);
+    renderFieldsList();
+    renderCustomAttrsList();
+};
+
+addAttrBtn.onclick = () => {
+    addAttrForm.innerHTML = '';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'Attribute name';
+    nameInput.className = 'input';
+    const typeSelect = document.createElement('select');
+    DATATYPES.forEach(dt => {
+        const opt = document.createElement('option');
+        opt.value = dt.value;
+        opt.textContent = dt.label;
+        typeSelect.appendChild(opt);
+    });
+    typeSelect.className = 'input datatype-dropdown';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'btn btn-add';
+    addBtn.textContent = 'Add';
+    addBtn.onclick = () => {
+        const name = nameInput.value.trim();
+        const type = typeSelect.value;
+        if (name && !(name in customAttrs)) {
+            customAttrs[name] = { type };
+            addAttrForm.innerHTML = '';
+            renderCustomAttrsList();
+            updateJsonPreview();
+        }
+    };
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => addAttrForm.innerHTML = '';
+    addAttrForm.appendChild(nameInput);
+    addAttrForm.appendChild(typeSelect);
+    addAttrForm.appendChild(addBtn);
+    addAttrForm.appendChild(cancelBtn);
+    addAttrForm.classList.remove('hidden');
+};
+
+partitionKeysSelect.onchange = function() {
+    partitionKeys = Array.from(partitionKeysSelect.selectedOptions).map(o => o.value);
+    updateJsonPreview();
+};
+datasetNameInput.oninput = updateJsonPreview;
+
+// CSV upload logic
+uploadCsvBtn.onclick = function() {
+    const file = csvFileInput.files[0];
+    if (!file) {
+        alert('Please select a CSV file.');
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        const text = e.target.result;
+        const parsed = parseCsvToFields(text);
+        csvFieldsOnly = parsed;
+        updateJsonPreview();
+    };
+    reader.readAsText(file);
+};
+
+// CSV to fields parser (simple: first row = headers, rest = values)
+function parseCsvToFields(csvText) {
+    // Example: header: name,type,value
+    const lines = csvText.trim().split(/\r?\n/);
+    if (lines.length < 2) return {};
+    const headers = lines[0].split(',').map(h => h.trim());
+    const result = {};
+    for (let i = 1; i < lines.length; i++) {
+        const row = lines[i].split(',');
+        let name = row[0]?.trim();
+        let type = row[1]?.trim().toLowerCase() || 'string';
+        let value = row[2]?.trim();
+        if (!name) continue;
+        result[name] = { type, value };
+    }
+    return result;
+}
+
+renderTeamNames();
+renderFieldsList();
+renderCustomAttrsList();
+updateJsonPreview();
+
+datasetForm.onsubmit = function(e) {
+    e.preventDefault();
+    alert('Submitted JSON:\n' + JSON.stringify(jsonData, null, 2));
+    // You can send jsonData to the backend here via AJAX or a POST request.
+};
+</script>
+</body>
+</html>
