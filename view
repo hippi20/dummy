@@ -1,542 +1,62 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>DynamoDB Dataset Editor</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #f7f7f7; margin: 0; }
-        .container { max-width: 800px; margin: 40px auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px #0001; padding: 32px; }
-        .row { display: flex; align-items: center; margin-bottom: 18px; }
-        .label { width: 140px; font-weight: bold; }
-        .input, select, textarea { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
-        .input[readonly] { background: #f0f0f0; }
-        .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
-        .btn-primary { background: #1976d2; color: #fff; }
-        .btn-adv { background: #eee; color: #1976d2; border: 1px solid #1976d2; margin-left: auto; }
-        .btn-adv.active { background: #1976d2; color: #fff; }
-        .btn-danger { background: #e53935; color: #fff; margin-left: 8px; }
-        .btn-add { background: #43a047; color: #fff; margin-left: 8px; }
-        .multi-select { min-height: 36px; background: #f9f9f9; border: 1px solid #bdbdbd; border-radius: 6px; font-size: 1em; transition: border 0.2s; }
-        .multi-select:focus { border: 1.5px solid #1976d2; background: #f0f7ff; }
-        .field-row { display: flex; align-items: center; margin-bottom: 8px; }
-        .field-row input { margin-right: 8px; }
-        .preview { background: #f4f4f4; border-radius: 4px; padding: 16px; font-family: monospace; margin-top: 24px; }
-        .right { float: right; }
-        .hidden { display: none; }
-        .adv-btns { margin-top: 10px; }
-        .datatype-dropdown { margin-left: 8px; }
-        .toggle-btn { background: none; border: none; font-size: 1.2em; cursor: pointer; margin-right: 4px; }
-        .subfields { margin-left: 32px; border-left: 2px solid #eee; padding-left: 12px; }
-        .teamnames-summary { color: #555; font-size: 0.95em; margin-left: 8px; }
-        .teamnames-list { margin-left: 32px; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="row" style="justify-content: space-between;">
-        <div style="font-size: 1.5em; font-weight: bold;">DynamoDB Dataset Editor</div>
-        <button id="advModeBtn" class="btn btn-adv">Advanced Mode</button>
-    </div>
+@csrf_exempt
+@require_POST
+def generate_athena_sql(request):
+    try:
+        data = json.loads(request.body)
+        dataset_name = data.get('dataset_name')
+        team_names = data.get('team_names', [])
+        attributes = data.get('attributes', {})
+        partition_keys = data.get('partition_keys', [])
+        if not dataset_name or not team_names or not isinstance(attributes, dict):
+            return JsonResponse({'error': 'Missing dataset_name, team_names, or attributes'}, status=400)
 
-    <form id="datasetForm" method="post" enctype="multipart/form-data">
-        {% csrf_token %}
-        <div class="row">
-            <div class="label">Dataset Name:</div>
-            <input class="input" type="text" id="datasetName" name="datasetName" required>
-        </div>
+        athena = boto3.client('athena',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_REGION')
+        )
+        sql_statements = []
+        for team in team_names:
+            # Fetch metadata from Athena
+            db = team
+            table = 'metadata'
+            try:
+                desc = athena.get_table_metadata(DatabaseName=db, TableName=table)
+                columns = desc['TableMetadata']['Columns']
+                meta_cols = {col['Name']: col['Type'] for col in columns}
+            except Exception as e:
+                meta_cols = {}
+            # Merge with attributes (attributes override metadata)
+            merged = dict(meta_cols)
+            for k, v in attributes.items():
+                # Athena type conversion
+                if v == 'string':
+                    merged[k] = 'string'
+                elif v == 'float':
+                    merged[k] = 'double'
+            # Generate columns SQL
+            cols_sql = ',\n  '.join([f'`{col}` {typ}' for col, typ in merged.items()])
+            # Partition keys
+            if not partition_keys:
+                partition_keys = ['dt']
+            partition_sql = ',\n  '.join([f'`{pk}` string' for pk in partition_keys])
+            table_name = f'{dataset_name}_{team}'
+            # SQL template (user can edit this block to add more lines)
+            sql = f'''-- Athena CREATE TABLE for team: {team}
+CREATE EXTERNAL TABLE IF NOT EXISTS `{table_name}` (
+  {cols_sql}
+)
+PARTITIONED BY (
+  {partition_sql}
+)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+WITH SERDEPROPERTIES (
+  'serialization.format' = '1'
+)
+LOCATION 's3://your-athena-data/{table_name}/';
+'''
+            sql_statements.append(sql)
+        return JsonResponse({'sql': '\n\n'.join(sql_statements)})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500) 
 
-        <div class="row">
-            <div class="label">Partition Keys:</div>
-            <select id="partitionKeys" class="input multi-select" multiple size="3" style="min-width:180px;">
-                <option value="kpigroup">kpigroup</option>
-                <option value="sessionid">sessionid</option>
-                <option value="dt">dt</option>
-            </select>
-            <span style="margin-left:8px; color:#888; font-size:0.95em;">(Hold Ctrl/Cmd or Shift to select multiple)</span>
-        </div>
-
-        <div class="row" id="teamNamesRow">
-            <div class="label">Team Names:</div>
-            <button type="button" id="toggleTeamNames" class="toggle-btn">▼</button>
-            <span id="teamNamesSummary" class="teamnames-summary"></span>
-        </div>
-        <div id="teamNamesList" class="teamnames-list"></div>
-
-        <div class="row adv-btns hidden" id="advBtns">
-            <button type="button" class="btn btn-add" id="addAttrBtn">Add Attribute</button>
-        </div>
-        <div id="addAttrForm" class="row hidden"></div>
-
-        <!-- JSON Textarea Input -->
-        <div class="row" id="jsonInputRow">
-            <div class="label">Paste JSON Fields:
-                <span id="jsonInfoIcon" style="cursor:pointer; margin-left:6px; color:#1976d2; font-size:1.1em;" title='Format: {"column_name": "string|float"}'>ℹ️</span>
-            </div>
-            <textarea id="jsonFieldsInput" class="input" rows="5" placeholder='{"snr": "float", "cqi": "string"}' style="flex:2;"></textarea>
-        </div>
-        <div class="row" id="jsonErrorRow" style="display:none; color:#e53935; font-weight:bold; margin-bottom:0;"></div>
-
-        <div id="fieldsList"></div>
-        <div id="customAttrsList"></div>
-
-        <div class="preview">
-            <div style="font-weight: bold; margin-bottom: 8px;">JSON Preview</div>
-            <pre id="jsonPreview"></pre>
-        </div>
-
-        <div class="row" style="justify-content: flex-end; margin-top: 24px;">
-            <button type="submit" class="btn btn-primary">Submit to DDB</button>
-        </div>
-
-        <!-- Athena SQL Output -->
-        <div class="row" id="athenaSqlRow" style="display:none; flex-direction:column; margin-top:32px;">
-            <div style="font-weight:bold; margin-bottom:8px;">Athena CREATE TABLE SQL</div>
-            <textarea id="athenaSqlOutput" class="input" rows="8" style="font-family:monospace;"></textarea>
-            <button type="button" class="btn btn-add" id="copyAthenaSqlBtn" style="width:120px; margin-top:8px;">Copy SQL</button>
-        </div>
-        <div class="row" id="athenaSqlErrorRow" style="display:none; color:#e53935; font-weight:bold; margin-bottom:0;"></div>
-        <div class="row" style="justify-content: flex-end; margin-top: 12px;">
-            <button type="button" class="btn btn-primary" id="createAthenaBtn">Create Athena DB</button>
-        </div>
-    </form>
-</div>
-
-<script>
-let advMode = false;
-let fields = {}; // { fieldName: { type: 'string', value: '', subfields: {} } }
-let customAttrs = {}; // { attrName: { type, value, subfields } }
-let partitionKeys = [];
-let teamNames = [];
-let teamNamesExpanded = true;
-let jsonData = {};
-let jsonFieldsOnly = {}; // fields loaded from JSON textarea, NOT merged into UI
-let jsonFieldsValid = true;
-
-const advModeBtn = document.getElementById('advModeBtn');
-const advBtns = document.getElementById('advBtns');
-const addAttrBtn = document.getElementById('addAttrBtn');
-const addAttrForm = document.getElementById('addAttrForm');
-const fieldsList = document.getElementById('fieldsList');
-const customAttrsList = document.getElementById('customAttrsList');
-const partitionKeysSelect = document.getElementById('partitionKeys');
-const jsonPreview = document.getElementById('jsonPreview');
-const datasetNameInput = document.getElementById('datasetName');
-const teamNamesRow = document.getElementById('teamNamesRow');
-const teamNamesList = document.getElementById('teamNamesList');
-const teamNamesSummary = document.getElementById('teamNamesSummary');
-const toggleTeamNames = document.getElementById('toggleTeamNames');
-const datasetForm = document.getElementById('datasetForm');
-const jsonFieldsInput = document.getElementById('jsonFieldsInput');
-const jsonErrorRow = document.getElementById('jsonErrorRow');
-const createAthenaBtn = document.getElementById('createAthenaBtn');
-const athenaSqlRow = document.getElementById('athenaSqlRow');
-const athenaSqlOutput = document.getElementById('athenaSqlOutput');
-const copyAthenaSqlBtn = document.getElementById('copyAthenaSqlBtn');
-const athenaSqlErrorRow = document.getElementById('athenaSqlErrorRow');
-
-const DATATYPES = [
-    { value: 'string', label: 'String' },
-    { value: 'float', label: 'Float' },
-    { value: 'number', label: 'Number' },
-    { value: 'map', label: 'Map' }
-];
-
-function renderTeamNames() {
-    teamNamesList.innerHTML = '';
-    if (!teamNamesExpanded) {
-        teamNamesList.style.display = 'none';
-        teamNamesSummary.textContent = teamNames.length ? teamNames.join(', ') : '(none)';
-        toggleTeamNames.textContent = '▶';
-        return;
-    }
-    teamNamesList.style.display = '';
-    teamNamesSummary.textContent = '';
-    toggleTeamNames.textContent = '▼';
-    teamNames.forEach((name, idx) => {
-        const row = document.createElement('div');
-        row.className = 'field-row';
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.value = name;
-        input.className = 'input';
-        input.onchange = e => {
-            teamNames[idx] = e.target.value;
-            updateJsonPreview();
-        };
-        row.appendChild(input);
-        const delBtn = document.createElement('button');
-        delBtn.type = 'button';
-        delBtn.className = 'btn btn-danger';
-        delBtn.textContent = '×';
-        delBtn.onclick = () => {
-            teamNames.splice(idx, 1);
-            renderTeamNames();
-            updateJsonPreview();
-        };
-        row.appendChild(delBtn);
-        teamNamesList.appendChild(row);
-    });
-    // Add new team name
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'btn btn-add';
-    addBtn.textContent = '+ Add Team';
-    addBtn.onclick = () => {
-        teamNames.push('');
-        renderTeamNames();
-        updateJsonPreview();
-    };
-    teamNamesList.appendChild(addBtn);
-}
-
-toggleTeamNames.onclick = () => {
-    teamNamesExpanded = !teamNamesExpanded;
-    renderTeamNames();
-};
-
-function renderFieldsList() {
-    fieldsList.innerHTML = '';
-    Object.entries(fields).forEach(([name, info]) => {
-        renderFieldRow(fieldsList, name, info, fields, 0, false);
-    });
-}
-
-function renderCustomAttrsList() {
-    customAttrsList.innerHTML = '';
-    Object.entries(customAttrs).forEach(([name, info]) => {
-        renderFieldRow(customAttrsList, name, info, customAttrs, 0, true);
-    });
-}
-
-function renderFieldRow(container, name, info, parentObj, depth, isCustom) {
-    const row = document.createElement('div');
-    row.className = 'field-row';
-    // Expand/collapse for map
-    let isMap = info.type === 'map';
-    let expanded = info._expanded !== false;
-    if (isMap) {
-        const toggleBtn = document.createElement('button');
-        toggleBtn.type = 'button';
-        toggleBtn.className = 'toggle-btn';
-        toggleBtn.textContent = expanded ? '▼' : '▶';
-        toggleBtn.onclick = () => {
-            info._expanded = !expanded;
-            if (isCustom) renderCustomAttrsList(); else renderFieldsList();
-        };
-        row.appendChild(toggleBtn);
-    }
-    // Field name
-    const nameInput = document.createElement('input');
-    nameInput.type = 'text';
-    nameInput.value = name;
-    nameInput.className = 'input';
-    nameInput.readOnly = !advMode;
-    nameInput.onchange = e => {
-        if (e.target.value && e.target.value !== name) {
-            parentObj[e.target.value] = { ...info };
-            delete parentObj[name];
-            if (isCustom) renderCustomAttrsList(); else renderFieldsList();
-            updateJsonPreview();
-        }
-    };
-    row.appendChild(nameInput);
-    // Type
-    const typeSelect = document.createElement('select');
-    DATATYPES.forEach(dt => {
-        const opt = document.createElement('option');
-        opt.value = dt.value;
-        opt.textContent = dt.label;
-        if (info.type === dt.value) opt.selected = true;
-        typeSelect.appendChild(opt);
-    });
-    typeSelect.disabled = !advMode;
-    typeSelect.className = 'input datatype-dropdown';
-    typeSelect.onchange = e => {
-        info.type = e.target.value;
-        if (info.type === 'map' && !info.subfields) info.subfields = {};
-        if (info.type !== 'map') delete info.subfields;
-        if (isCustom) renderCustomAttrsList(); else renderFieldsList();
-        updateJsonPreview();
-    };
-    row.appendChild(typeSelect);
-    // Value (optional, for advanced mode)
-    if (advMode && info.type !== 'map') {
-        const valInput = document.createElement('input');
-        valInput.type = 'text';
-        valInput.value = info.value || '';
-        valInput.placeholder = 'Value (optional)';
-        valInput.className = 'input';
-        valInput.onchange = e => {
-            info.value = e.target.value;
-            updateJsonPreview();
-        };
-        row.appendChild(valInput);
-    }
-    // Remove button
-    if (advMode) {
-        const delBtn = document.createElement('button');
-        delBtn.type = 'button';
-        delBtn.className = 'btn btn-danger';
-        delBtn.textContent = '×';
-        delBtn.onclick = () => {
-            delete parentObj[name];
-            if (isCustom) renderCustomAttrsList(); else renderFieldsList();
-            updateJsonPreview();
-        };
-        row.appendChild(delBtn);
-    }
-    container.appendChild(row);
-    // Subfields for map
-    if (isMap && expanded) {
-        const subDiv = document.createElement('div');
-        subDiv.className = 'subfields';
-        if (!info.subfields) info.subfields = {};
-        Object.entries(info.subfields).forEach(([subName, subInfo]) => {
-            renderFieldRow(subDiv, subName, subInfo, info.subfields, depth + 1, isCustom);
-        });
-        // Add subfield button (adv mode)
-        if (advMode) {
-            const addSubBtn = document.createElement('button');
-            addSubBtn.type = 'button';
-            addSubBtn.className = 'btn btn-add';
-            addSubBtn.textContent = '+ Add Subfield';
-            addSubBtn.onclick = () => showAddSubfieldForm(info.subfields, subDiv, isCustom);
-            subDiv.appendChild(addSubBtn);
-        }
-        container.appendChild(subDiv);
-    }
-}
-
-function showAddSubfieldForm(subfieldsObj, container, isCustom) {
-    // Only one form at a time
-    if (container.querySelector('.add-field-form')) return;
-    const formDiv = document.createElement('div');
-    formDiv.className = 'add-field-form field-row';
-    const nameInput = document.createElement('input');
-    nameInput.type = 'text';
-    nameInput.placeholder = 'Subfield name';
-    nameInput.className = 'input';
-    const typeSelect = document.createElement('select');
-    DATATYPES.forEach(dt => {
-        const opt = document.createElement('option');
-        opt.value = dt.value;
-        opt.textContent = dt.label;
-        typeSelect.appendChild(opt);
-    });
-    typeSelect.className = 'input datatype-dropdown';
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'btn btn-add';
-    addBtn.textContent = 'Add';
-    addBtn.onclick = () => {
-        const name = nameInput.value.trim();
-        const type = typeSelect.value;
-        if (name && !(name in subfieldsObj)) {
-            subfieldsObj[name] = { type };
-            formDiv.remove();
-            renderTeamNames();
-            if (isCustom) renderCustomAttrsList(); else renderFieldsList();
-            updateJsonPreview();
-        }
-    };
-    const cancelBtn = document.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.className = 'btn';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.onclick = () => formDiv.remove();
-    formDiv.appendChild(nameInput);
-    formDiv.appendChild(typeSelect);
-    formDiv.appendChild(addBtn);
-    formDiv.appendChild(cancelBtn);
-    container.appendChild(formDiv);
-}
-
-function updateJsonPreview() {
-    // Only update if valid
-    if (!jsonFieldsValid) {
-        jsonPreview.textContent = '';
-        return;
-    }
-    // Recursively build the JSON structure
-    function buildFieldsM(obj) {
-        const result = {};
-        Object.entries(obj).forEach(([name, info]) => {
-            if (info.type === 'map') {
-                result[name] = { map: buildFieldsM(info.subfields || {}) };
-            } else {
-                result[name] = info.type;
-            }
-        });
-        return result;
-    }
-    function buildCustomAttrs(obj) {
-        const result = {};
-        Object.entries(obj).forEach(([name, info]) => {
-            if (info.type === 'map') {
-                result[name] = { map: buildFieldsM(info.subfields || {}) };
-            } else {
-                result[name] = info.value !== undefined && info.value !== '' ? info.value : info.type;
-            }
-        });
-        return result;
-    }
-    // Merge jsonFieldsOnly and fields, with fields (manual) taking precedence
-    function mergeFields(jsonObj, manualObj) {
-        return { ...jsonObj, ...manualObj };
-    }
-    const fieldsM = mergeFields(
-        jsonFieldsOnly,
-        buildFieldsM(fields)
-    );
-    const customAttrsObj = buildCustomAttrs(customAttrs);
-    jsonData = {
-        DatasetName: datasetNameInput.value,
-        Fields: { M: fieldsM },
-        PartitionKeys: Array.from(partitionKeysSelect.selectedOptions).map(o => o.value),
-        TeamNames: teamNames.filter(t => t.trim() !== ''),
-        ...customAttrsObj
-    };
-    jsonPreview.textContent = JSON.stringify(jsonData, null, 2);
-}
-
-advModeBtn.onclick = () => {
-    advMode = !advMode;
-    advModeBtn.classList.toggle('active', advMode);
-    advBtns.classList.toggle('hidden', !advMode);
-    renderFieldsList();
-    renderCustomAttrsList();
-};
-
-addAttrBtn.onclick = () => {
-    addAttrForm.innerHTML = '';
-    const nameInput = document.createElement('input');
-    nameInput.type = 'text';
-    nameInput.placeholder = 'Attribute name';
-    nameInput.className = 'input';
-    const typeSelect = document.createElement('select');
-    DATATYPES.forEach(dt => {
-        const opt = document.createElement('option');
-        opt.value = dt.value;
-        opt.textContent = dt.label;
-        typeSelect.appendChild(opt);
-    });
-    typeSelect.className = 'input datatype-dropdown';
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'btn btn-add';
-    addBtn.textContent = 'Add';
-    addBtn.onclick = () => {
-        const name = nameInput.value.trim();
-        const type = typeSelect.value;
-        if (name && !(name in customAttrs)) {
-            customAttrs[name] = { type };
-            addAttrForm.innerHTML = '';
-            renderCustomAttrsList();
-            updateJsonPreview();
-        }
-    };
-    const cancelBtn = document.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.className = 'btn';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.onclick = () => addAttrForm.innerHTML = '';
-    addAttrForm.appendChild(nameInput);
-    addAttrForm.appendChild(typeSelect);
-    addAttrForm.appendChild(addBtn);
-    addAttrForm.appendChild(cancelBtn);
-    addAttrForm.classList.remove('hidden');
-};
-
-partitionKeysSelect.onchange = function() {
-    partitionKeys = Array.from(partitionKeysSelect.selectedOptions).map(o => o.value);
-    updateJsonPreview();
-};
-datasetNameInput.oninput = updateJsonPreview;
-
-// JSON textarea logic with validation
-jsonFieldsInput.oninput = function() {
-    let error = '';
-    try {
-        const parsed = JSON.parse(jsonFieldsInput.value || '{}');
-        jsonFieldsOnly = {};
-        Object.entries(parsed).forEach(([k, v]) => {
-            if (typeof v !== 'string' || (v !== 'string' && v !== 'float')) {
-                error = `Invalid datatype for '${k}': '${v}'. Only 'string' and 'float' allowed.`;
-            } else {
-                jsonFieldsOnly[k] = v;
-            }
-        });
-    } catch (e) {
-        error = 'Invalid JSON syntax.';
-        jsonFieldsOnly = {};
-    }
-    if (error) {
-        jsonFieldsValid = false;
-        jsonErrorRow.textContent = error;
-        jsonErrorRow.style.display = '';
-    } else {
-        jsonFieldsValid = true;
-        jsonErrorRow.textContent = '';
-        jsonErrorRow.style.display = 'none';
-    }
-    updateJsonPreview();
-};
-
-renderTeamNames();
-renderFieldsList();
-renderCustomAttrsList();
-updateJsonPreview();
-
-datasetForm.onsubmit = function(e) {
-    e.preventDefault();
-    alert('Submitted JSON:\n' + JSON.stringify(jsonData, null, 2));
-    // You can send jsonData to the backend here via AJAX or a POST request.
-};
-
-// Athena SQL generation logic
-createAthenaBtn.onclick = async function() {
-    athenaSqlRow.style.display = 'none';
-    athenaSqlErrorRow.style.display = 'none';
-    if (!jsonFieldsValid) {
-        athenaSqlErrorRow.textContent = 'Please fix JSON errors before creating Athena DB.';
-        athenaSqlErrorRow.style.display = '';
-        return;
-    }
-    const datasetName = datasetNameInput.value.trim();
-    const teamNamesList = teamNames.filter(t => t.trim() !== '');
-    if (!datasetName || teamNamesList.length === 0) {
-        athenaSqlErrorRow.textContent = 'Please enter a dataset name and at least one team name.';
-        athenaSqlErrorRow.style.display = '';
-        return;
-    }
-    // POST to backend
-    try {
-        const resp = await fetch('/athena/generate_sql/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': '{{ csrf_token }}' },
-            body: JSON.stringify({
-                dataset_name: datasetName,
-                team_names: teamNamesList,
-                attributes: jsonFieldsOnly
-            })
-        });
-        if (!resp.ok) throw new Error('Server error');
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error);
-        athenaSqlOutput.value = data.sql || '';
-        athenaSqlRow.style.display = '';
-    } catch (e) {
-        athenaSqlErrorRow.textContent = e.message || 'Failed to generate Athena SQL.';
-        athenaSqlErrorRow.style.display = '';
-    }
-};
-
-copyAthenaSqlBtn.onclick = function() {
-    athenaSqlOutput.select();
-    document.execCommand('copy');
-    copyAthenaSqlBtn.textContent = 'Copied!';
-    setTimeout(() => { copyAthenaSqlBtn.textContent = 'Copy SQL'; }, 1200);
-};
-</script>
-</body>
-</html>
