@@ -55,12 +55,19 @@
             <span style="margin-left:8px; color:#888; font-size:0.95em;">(Hold Ctrl/Cmd or Shift to select multiple)</span>
         </div>
 
-        <div class="row" id="teamNamesRow">
-            <div class="label">Team Names:</div>
-            <button type="button" id="toggleTeamNames" class="toggle-btn">▼</button>
-            <span id="teamNamesSummary" class="teamnames-summary"></span>
+        <!-- Custom Multi-select Team Dropdown -->
+        <div class="row" id="customTeamSelectRow" style="align-items: flex-start;">
+            <div class="label" style="padding-top: 8px;">Team Names:</div>
+            <div id="teamSelectContainer" style="flex: 1; position: relative;">
+                <div id="selectedTeamsDisplay" class="input" style="cursor: pointer; min-height: 38px; display: flex; flex-wrap: wrap; align-items: center; padding: 0 8px; gap: 4px;">
+                    <span style="color: #888;" id="teamPlaceholder">Select teams...</span>
+                </div>
+                <div id="teamDropdown" style="position: absolute; top: 100%; left: 0; right: 0; z-index: 10; background: #fff; border: 1px solid #ccc; border-radius: 4px; max-height: 180px; overflow-y: auto; box-shadow: 0 4px 8px rgba(0,0,0,0.1); display: none;">
+                    <input type="text" id="teamSearchInput" class="input" placeholder="Search teams..." style="margin: 8px; width: calc(100% - 16px);">
+                    <ul id="teamOptionsList" style="list-style: none; padding: 0 8px; margin: 0;"></ul>
+                </div>
+            </div>
         </div>
-        <div id="teamNamesList" class="teamnames-list"></div>
 
         <div class="row adv-btns hidden" id="advBtns">
             <button type="button" class="btn btn-add" id="addAttrBtn">Add Attribute</button>
@@ -81,7 +88,7 @@
 
         <div class="preview">
             <div style="font-weight: bold; margin-bottom: 8px;">JSON Preview</div>
-            <pre id="jsonPreview"></pre>
+            <textarea id="jsonPreview" class="input" rows="20" style="font-family: monospace; resize: vertical;"></textarea>
         </div>
 
         <div class="row" style="justify-content: flex-end; margin-top: 24px;">
@@ -91,7 +98,7 @@
         <!-- Athena SQL Output -->
         <div class="row" id="athenaSqlRow" style="display:none; flex-direction:column; margin-top:32px;">
             <div style="font-weight:bold; margin-bottom:8px;">Athena CREATE TABLE SQL</div>
-            <textarea id="athenaSqlOutput" class="input" rows="8" style="font-family:monospace;"></textarea>
+            <textarea id="athenaSqlOutput" class="input" rows="15" style="font-family:monospace;"></textarea>
             <button type="button" class="btn btn-add" id="copyAthenaSqlBtn" style="width:120px; margin-top:8px;">Copy SQL</button>
         </div>
         <div class="row" id="athenaSqlErrorRow" style="display:none; color:#e53935; font-weight:bold; margin-bottom:0;"></div>
@@ -105,12 +112,17 @@
 let advMode = false;
 let fields = {}; // { fieldName: { type: 'string', value: '', subfields: {} } }
 let customAttrs = {}; // { attrName: { type, value, subfields } }
-let partitionKeys = [];
-let teamNames = [];
-let teamNamesExpanded = true;
-let jsonData = {};
 let jsonFieldsOnly = {}; // fields loaded from JSON textarea, NOT merged into UI
 let jsonFieldsValid = true;
+let partitionKeys = [];
+let teamNames = []; // Array to hold selected team names
+let jsonData = {};
+
+// List of all available teams
+const ALL_TEAMS = ['team1', 'team2','team3','team4','team5','team6']; // Placeholder list
+
+// Wrap the rest of the script in DOMContentLoaded
+document.addEventListener('DOMContentLoaded', (event) => {
 
 const advModeBtn = document.getElementById('advModeBtn');
 const advBtns = document.getElementById('advBtns');
@@ -121,10 +133,6 @@ const customAttrsList = document.getElementById('customAttrsList');
 const partitionKeysSelect = document.getElementById('partitionKeys');
 const jsonPreview = document.getElementById('jsonPreview');
 const datasetNameInput = document.getElementById('datasetName');
-const teamNamesRow = document.getElementById('teamNamesRow');
-const teamNamesList = document.getElementById('teamNamesList');
-const teamNamesSummary = document.getElementById('teamNamesSummary');
-const toggleTeamNames = document.getElementById('toggleTeamNames');
 const datasetForm = document.getElementById('datasetForm');
 const jsonFieldsInput = document.getElementById('jsonFieldsInput');
 const jsonErrorRow = document.getElementById('jsonErrorRow');
@@ -134,6 +142,15 @@ const athenaSqlOutput = document.getElementById('athenaSqlOutput');
 const copyAthenaSqlBtn = document.getElementById('copyAthenaSqlBtn');
 const athenaSqlErrorRow = document.getElementById('athenaSqlErrorRow');
 
+// Custom Team Select Elements
+const teamSelectContainer = document.getElementById('teamSelectContainer');
+const selectedTeamsDisplay = document.getElementById('selectedTeamsDisplay');
+const teamDropdown = document.getElementById('teamDropdown');
+const teamSearchInput = document.getElementById('teamSearchInput');
+const teamOptionsList = document.getElementById('teamOptionsList');
+const teamPlaceholder = document.getElementById('teamPlaceholder');
+
+
 const DATATYPES = [
     { value: 'string', label: 'String' },
     { value: 'float', label: 'Float' },
@@ -141,58 +158,116 @@ const DATATYPES = [
     { value: 'map', label: 'Map' }
 ];
 
-function renderTeamNames() {
-    teamNamesList.innerHTML = '';
-    if (!teamNamesExpanded) {
-        teamNamesList.style.display = 'none';
-        teamNamesSummary.textContent = teamNames.length ? teamNames.join(', ') : '(none)';
-        toggleTeamNames.textContent = '▶';
-        return;
-    }
-    teamNamesList.style.display = '';
-    teamNamesSummary.textContent = '';
-    toggleTeamNames.textContent = '▼';
-    teamNames.forEach((name, idx) => {
-        const row = document.createElement('div');
-        row.className = 'field-row';
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.value = name;
-        input.className = 'input';
-        input.onchange = e => {
-            teamNames[idx] = e.target.value;
-            updateJsonPreview();
+// --- Custom Team Select Logic ---
+
+// Function to render the team options in the dropdown
+function renderTeamOptions(filter = '') {
+    teamOptionsList.innerHTML = ''; // Clear current options
+    const lowerFilter = filter.toLowerCase();
+    ALL_TEAMS.filter(team => team.toLowerCase().includes(lowerFilter))
+             .forEach(team => {
+        const li = document.createElement('li');
+        li.style.padding = '8px';
+        li.style.cursor = 'pointer';
+        li.style.borderBottom = '1px solid #eee';
+        li.style.display = 'flex';
+        li.style.alignItems = 'center';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.value = team;
+        checkbox.checked = teamNames.includes(team); // Set checked state based on teamNames array
+        checkbox.style.marginRight = '8px';
+
+        const label = document.createElement('label');
+        label.textContent = team;
+        label.style.flexGrow = 1;
+        label.style.cursor = 'pointer';
+
+        li.appendChild(checkbox);
+        li.appendChild(label);
+
+        // Handle click on the list item (checks/unchecks the box and updates)
+        li.onclick = (e) => {
+             // Prevent click on li from closing dropdown if clicking checkbox/label
+            if (e.target !== checkbox && e.target !== label) {
+                 checkbox.checked = !checkbox.checked;
+            }
+             handleTeamSelection(team, checkbox.checked);
         };
-        row.appendChild(input);
-        const delBtn = document.createElement('button');
-        delBtn.type = 'button';
-        delBtn.className = 'btn btn-danger';
-        delBtn.textContent = '×';
-        delBtn.onclick = () => {
-            teamNames.splice(idx, 1);
-            renderTeamNames();
-            updateJsonPreview();
+
+        // Handle click on the checkbox itself
+        checkbox.onclick = (e) => {
+             e.stopPropagation(); // Prevent li click handler from firing
+             handleTeamSelection(team, checkbox.checked);
         };
-        row.appendChild(delBtn);
-        teamNamesList.appendChild(row);
+
+        teamOptionsList.appendChild(li);
     });
-    // Add new team name
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'btn btn-add';
-    addBtn.textContent = '+ Add Team';
-    addBtn.onclick = () => {
-        teamNames.push('');
-        renderTeamNames();
-        updateJsonPreview();
-    };
-    teamNamesList.appendChild(addBtn);
 }
 
-toggleTeamNames.onclick = () => {
-    teamNamesExpanded = !teamNamesExpanded;
-    renderTeamNames();
+// Function to handle team selection/deselection
+function handleTeamSelection(team, isChecked) {
+    if (isChecked) {
+        if (!teamNames.includes(team)) {
+            teamNames.push(team);
+        }
+    } else {
+        teamNames = teamNames.filter(t => t !== team);
+    }
+    updateSelectedTeamsDisplay();
+    updateJsonPreview();
+     // Keep dropdown open after selection
+    teamDropdown.style.display = 'block';
+}
+
+// Function to update the display area with selected teams
+function updateSelectedTeamsDisplay() {
+    selectedTeamsDisplay.innerHTML = ''; // Clear current display
+    if (teamNames.length === 0) {
+        teamPlaceholder.style.display = '';
+        selectedTeamsDisplay.appendChild(teamPlaceholder);
+    } else {
+         teamPlaceholder.style.display = 'none';
+        teamNames.forEach(team => {
+            const span = document.createElement('span');
+            span.textContent = team;
+            span.style.background = '#e0e0e0';
+            span.style.borderRadius = '4px';
+            span.style.padding = '2px 6px';
+            span.style.marginRight = '4px';
+            span.style.fontSize = '0.9em';
+             selectedTeamsDisplay.appendChild(span);
+        });
+    }
+}
+
+// Toggle dropdown visibility
+selectedTeamsDisplay.onclick = () => {
+    const isVisible = teamDropdown.style.display === 'block';
+    if (!isVisible) {
+         renderTeamOptions(teamSearchInput.value); // Render with current search filter
+         teamDropdown.style.display = 'block';
+         teamSearchInput.focus(); // Focus search input when opening
+    } else {
+         teamDropdown.style.display = 'none';
+    }
 };
+
+// Filter options on search input
+teamSearchInput.oninput = () => {
+    renderTeamOptions(teamSearchInput.value);
+};
+
+// Close dropdown when clicking outside
+document.addEventListener('click', (e) => {
+    if (!teamSelectContainer.contains(e.target)) {
+        teamDropdown.style.display = 'none';
+    }
+});
+
+
+// --- Existing Functions (restored and integrated) ---
 
 function renderFieldsList() {
     fieldsList.innerHTML = '';
@@ -334,7 +409,7 @@ function showAddSubfieldForm(subfieldsObj, container, isCustom) {
         if (name && !(name in subfieldsObj)) {
             subfieldsObj[name] = { type };
             formDiv.remove();
-            renderTeamNames();
+            // Note: renderTeamNames is no longer used for the options list
             if (isCustom) renderCustomAttrsList(); else renderFieldsList();
             updateJsonPreview();
         }
@@ -351,52 +426,131 @@ function showAddSubfieldForm(subfieldsObj, container, isCustom) {
     container.appendChild(formDiv);
 }
 
+// JSON textarea logic with validation
+jsonFieldsInput.oninput = function() {
+    let error = '';
+    try {
+        const parsed = JSON.parse(jsonFieldsInput.value || '{}');
+        jsonFieldsOnly = {};
+        Object.entries(parsed).forEach(([k, v]) => {
+            if (typeof v !== 'string' || (v !== 'string' && v !== 'float')) {
+                error = `Invalid datatype for '${k}': '${v}'. Only 'string' and 'float' allowed.`;
+            } else {
+                // Store original type string for backend processing
+                jsonFieldsOnly[k] = v;
+            }
+        });
+    } catch (e) {
+        error = 'Invalid JSON syntax.';
+        jsonFieldsOnly = {};
+    }
+    if (error) {
+        jsonFieldsValid = false;
+        jsonErrorRow.textContent = error;
+        jsonErrorRow.style.display = '';
+    } else {
+        jsonFieldsValid = true;
+        jsonErrorRow.textContent = '';
+        jsonErrorRow.style.display = 'none';
+    }
+    updateJsonPreview();
+};
+
+// Add input listener for the JSON preview textarea
+jsonPreview.oninput = function() {
+    try {
+        // Attempt to parse the edited JSON
+        const editedJson = JSON.parse(jsonPreview.value);
+        // If valid, update the jsonData object
+        jsonData = editedJson;
+        // Clear any previous error message
+        jsonErrorRow.textContent = '';
+        jsonErrorRow.style.display = 'none';
+    } catch (e) {
+        // If invalid JSON, show an error but *do not* update jsonData
+        jsonErrorRow.textContent = 'JSON Preview syntax error: ' + e.message;
+        jsonErrorRow.style.display = '';
+        // Keep the last valid jsonData
+    }
+    // Note: We don't call updateJsonPreview() here to avoid overwriting manual edits immediately
+    // The jsonData object is updated if valid JSON is entered.
+    // UI changes will rebuild jsonData from UI state and update the textarea.
+};
+
 function updateJsonPreview() {
-    // Only update if valid
+    // Only update if valid JSON in the input textarea
     if (!jsonFieldsValid) {
-        jsonPreview.textContent = '';
+        jsonPreview.value = ''; // Clear preview if input JSON is invalid
         return;
     }
-    // Recursively build the JSON structure
+
+    // --- Existing logic to build jsonData from UI elements ---
+    // Recursively build the JSON structure for manual fields
     function buildFieldsM(obj) {
         const result = {};
         Object.entries(obj).forEach(([name, info]) => {
             if (info.type === 'map') {
                 result[name] = { map: buildFieldsM(info.subfields || {}) };
             } else {
+                 // Store original type string for backend processing
                 result[name] = info.type;
             }
         });
         return result;
     }
+
+    // Recursively build the JSON structure for custom attributes
     function buildCustomAttrs(obj) {
         const result = {};
         Object.entries(obj).forEach(([name, info]) => {
             if (info.type === 'map') {
-                result[name] = { map: buildFieldsM(info.subfields || {}) };
+                result[name] = { map: buildFieldsM(info.subfields || {}) }; // Use buildFieldsM for nested structure
             } else {
+                 // If value is provided, use it; otherwise, use the type string
                 result[name] = info.value !== undefined && info.value !== '' ? info.value : info.type;
             }
         });
         return result;
     }
-    // Merge jsonFieldsOnly and fields, with fields (manual) taking precedence
-    function mergeFields(jsonObj, manualObj) {
-        return { ...jsonObj, ...manualObj };
-    }
-    const fieldsM = mergeFields(
-        jsonFieldsOnly,
-        buildFieldsM(fields)
-    );
+
+    // Merge jsonFieldsOnly (JSON textarea) and fields (manual UI), manual fields taking precedence
+    const fieldsM = { ...jsonFieldsOnly }; // Start with fields from JSON textarea
+    // Add/overwrite with fields from manual UI
+    Object.entries(fields).forEach(([name, info]) => {
+        if (info.type === 'map') {
+             fieldsM[name] = { map: buildFieldsM(info.subfields || {}) };
+        } else {
+            // Store original type string for backend processing
+             fieldsM[name] = info.type;
+        }
+    });
+
     const customAttrsObj = buildCustomAttrs(customAttrs);
-    jsonData = {
+
+    // Build the main jsonData object from UI elements
+    const uiBuiltJsonData = {
         DatasetName: datasetNameInput.value,
         Fields: { M: fieldsM },
         PartitionKeys: Array.from(partitionKeysSelect.selectedOptions).map(o => o.value),
-        TeamNames: teamNames.filter(t => t.trim() !== ''),
+        TeamNames: teamNames, // Use the teamNames array populated by the custom select
         ...customAttrsObj
     };
-    jsonPreview.textContent = JSON.stringify(jsonData, null, 2);
+
+    // --- Update the editable textarea ---
+    // If the user has made edits to the textarea and it's currently valid JSON,
+    // we *could* try to preserve those edits, but given the complex structure,
+    // it's simpler and safer to rebuild the JSON from the UI state and display that.
+    // The user's textarea edits will be used *only* if they don't interact with the UI
+    // elements that trigger a rebuild, or if they copy from the textarea after editing.
+    // We set jsonData to the UI-built version here.
+    jsonData = uiBuiltJsonData;
+    jsonPreview.value = JSON.stringify(jsonData, null, 2);
+
+    // Ensure the JSON preview syntax error is cleared if a valid update occurs from UI
+     if (jsonFieldsValid && jsonErrorRow.style.display !== 'none' && !jsonPreview.value) {
+          jsonErrorRow.textContent = '';
+          jsonErrorRow.style.display = 'none';
+     }
 }
 
 advModeBtn.onclick = () => {
@@ -451,47 +605,8 @@ partitionKeysSelect.onchange = function() {
     partitionKeys = Array.from(partitionKeysSelect.selectedOptions).map(o => o.value);
     updateJsonPreview();
 };
+
 datasetNameInput.oninput = updateJsonPreview;
-
-// JSON textarea logic with validation
-jsonFieldsInput.oninput = function() {
-    let error = '';
-    try {
-        const parsed = JSON.parse(jsonFieldsInput.value || '{}');
-        jsonFieldsOnly = {};
-        Object.entries(parsed).forEach(([k, v]) => {
-            if (typeof v !== 'string' || (v !== 'string' && v !== 'float')) {
-                error = `Invalid datatype for '${k}': '${v}'. Only 'string' and 'float' allowed.`;
-            } else {
-                jsonFieldsOnly[k] = v;
-            }
-        });
-    } catch (e) {
-        error = 'Invalid JSON syntax.';
-        jsonFieldsOnly = {};
-    }
-    if (error) {
-        jsonFieldsValid = false;
-        jsonErrorRow.textContent = error;
-        jsonErrorRow.style.display = '';
-    } else {
-        jsonFieldsValid = true;
-        jsonErrorRow.textContent = '';
-        jsonErrorRow.style.display = 'none';
-    }
-    updateJsonPreview();
-};
-
-renderTeamNames();
-renderFieldsList();
-renderCustomAttrsList();
-updateJsonPreview();
-
-datasetForm.onsubmit = function(e) {
-    e.preventDefault();
-    alert('Submitted JSON:\n' + JSON.stringify(jsonData, null, 2));
-    // You can send jsonData to the backend here via AJAX or a POST request.
-};
 
 // Athena SQL generation logic
 createAthenaBtn.onclick = async function() {
@@ -503,9 +618,10 @@ createAthenaBtn.onclick = async function() {
         return;
     }
     const datasetName = datasetNameInput.value.trim();
-    const teamNamesList = teamNames.filter(t => t.trim() !== '');
+    const teamNamesList = teamNames.filter(t => t.trim() !== ''); // Use the teamNames array from custom select
+    const partitionKeysList = Array.from(partitionKeysSelect.selectedOptions).map(o => o.value);
     if (!datasetName || teamNamesList.length === 0) {
-        athenaSqlErrorRow.textContent = 'Please enter a dataset name and at least one team name.';
+        athenaSqlErrorRow.textContent = 'Please enter a dataset name and select at least one team.';
         athenaSqlErrorRow.style.display = '';
         return;
     }
@@ -517,7 +633,8 @@ createAthenaBtn.onclick = async function() {
             body: JSON.stringify({
                 dataset_name: datasetName,
                 team_names: teamNamesList,
-                attributes: jsonFieldsOnly
+                attributes: jsonFieldsOnly, // Send JSON textarea attributes
+                partition_keys: partitionKeysList
             })
         });
         if (!resp.ok) throw new Error('Server error');
@@ -537,6 +654,23 @@ copyAthenaSqlBtn.onclick = function() {
     copyAthenaSqlBtn.textContent = 'Copied!';
     setTimeout(() => { copyAthenaSqlBtn.textContent = 'Copy SQL'; }, 1200);
 };
+
+// Initial render of team options and display
+renderTeamOptions(''); // Render all options initially
+updateSelectedTeamsDisplay(); // Update display based on initial empty teamNames
+
+// Initial renders for other sections
+renderFieldsList();
+renderCustomAttrsList();
+updateJsonPreview();
+
+datasetForm.onsubmit = function(e) {
+    e.preventDefault();
+    alert('Submitted JSON:\n' + JSON.stringify(jsonData, null, 2));
+    // You can send jsonData to the backend here via AJAX or a POST request.
+};
+
+}); // End DOMContentLoaded
 </script>
 </body>
 </html>
